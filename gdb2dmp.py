@@ -16,7 +16,6 @@ import struct
 import os
 import re
 import time
-import json
 
 # ═══════════════════════════════════════════════════════════════
 #  Constants
@@ -64,6 +63,16 @@ DUMP_VALID_DUMP64 = 0x34365544  # 'DU64'
 IMAGE_FILE_MACHINE_AMD64 = 0x8664
 DUMP_HEADER64_SIZE = 8192
 DUMP_TYPE_FULL = 1
+MAX_DUMP_HEADER64_RUNS = (DH64_CONTEXT_RECORD - (DH64_PHYSICAL_MEMORY_BLOCK + 0x10)) // 16
+
+def _gdb_cli_filename(path):
+    """Return a GDB memory-dump filename.
+
+    GDB's dump/append memory commands on Windows pass double quotes through
+    to CreateFile instead of treating them as CLI quoting, so quoted paths fail
+    with ERROR_INVALID_PARAMETER. Use forward slashes and leave the path bare.
+    """
+    return os.path.abspath(path).replace('\\', '/')
 
 KUSER_SHARED_DATA = 0xFFFFF78000000000
 
@@ -108,9 +117,6 @@ def _read_qword_phys(pa):
     d = _read_phys(pa, 8)
     return struct.unpack_from('<Q', d, 0)[0] if len(d) >= 8 else 0
 
-def _read_qword_virt(va):
-    d = _read_virt(va, 8)
-    return struct.unpack_from('<Q', d, 0)[0] if len(d) >= 8 else 0
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -142,6 +148,22 @@ def _va_to_pa(cr3, va):
     if not (pte & 1):
         return 0
     return (pte & 0x000FFFFFFFFFF000) + page_off
+
+def _read_kernel_va(cr3, va, length):
+    """Read kernel VA by walking page tables and reading physical pages."""
+    out = bytearray()
+    while length > 0:
+        pa = _va_to_pa(cr3, va)
+        if not pa:
+            break
+        n = min(length, PAGE_SIZE - (va & (PAGE_SIZE - 1)))
+        data = _read_phys(pa, n)
+        if len(data) != n:
+            break
+        out.extend(data)
+        va += n
+        length -= n
+    return bytes(out)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -233,13 +255,8 @@ def _detect_kernel_base(cr3, rip):
 def _scan_kdbg(cr3, kernel_base_va):
     """Scan kernel .data section for KDBG block. Returns dict of kernel info."""
     print("[*] Scanning for KDBG ...")
-    base_pa = _va_to_pa(cr3, kernel_base_va)
-    if not base_pa:
-        print("    ERROR: cannot translate kernel base to PA")
-        return {}
-
-    # Read PE header for section table
-    hdr = _read_phys(base_pa, 480)
+    # Read PE header for section table.
+    hdr = _read_kernel_va(cr3, kernel_base_va, 0x1000)
     if len(hdr) < 0x100 or hdr[:2] != b'MZ':
         print("    ERROR: invalid kernel PE header")
         return {}
@@ -250,7 +267,7 @@ def _scan_kdbg(cr3, kernel_base_va):
     sec_start = e_lfanew + 24 + opt_hdr_size
 
     # Read section table
-    sec_data = _read_phys(base_pa + sec_start, num_sections * 40)
+    sec_data = _read_kernel_va(cr3, kernel_base_va + sec_start, num_sections * 40)
     if len(sec_data) < num_sections * 40:
         print("    ERROR: short section table read")
         return {}
@@ -269,29 +286,29 @@ def _scan_kdbg(cr3, kernel_base_va):
         return {}
 
     print(f"    .data: VA=0x{data_va:x} size=0x{data_sz:x}")
-    data_pa = _va_to_pa(cr3, kernel_base_va + data_va)
-    if not data_pa:
-        print("    ERROR: cannot translate .data to PA")
-        return {}
-
-    # Scan for KDBG tag
+    # Scan for KDBG tag. Use page-table-backed VA reads instead of assuming
+    # the mapped image is physically contiguous.
     KDBG_STRUCT_SIZE = 0x280
+    chunk_len = 0x10000
+    step = chunk_len - KDBG_STRUCT_SIZE
     offset = 0
     while offset < data_sz:
-        chunk_sz = min(4096, data_sz - offset)
-        chunk = _read_phys(data_pa + offset, chunk_sz)
-        if not chunk or len(chunk) < 0xD0:
+        chunk_sz = min(chunk_len, data_sz - offset)
+        chunk = _read_kernel_va(cr3, kernel_base_va + data_va + offset, chunk_sz)
+        if not chunk or len(chunk) < 0x20:
             break
 
-        for o in range(16, len(chunk) - 0xD0, 4):
+        limit = len(chunk) - 4
+
+        for o in range(16, limit, 4):
             if struct.unpack_from('<I', chunk, o)[0] != KDBG_TAG:
                 continue
             k = o - 16
             if k < 0 or k + KDBG_STRUCT_SIZE > len(chunk):
                 continue
             kdbg_va = kernel_base_va + data_va + offset + k
-            # Read full KDBG
-            full = _read_phys(data_pa + offset + k, KDBG_STRUCT_SIZE)
+            # Read full KDBG from VA; the structure may cross a physical page.
+            full = _read_kernel_va(cr3, kdbg_va, KDBG_STRUCT_SIZE)
             if len(full) < KDBG_STRUCT_SIZE:
                 continue
             kern_base = struct.unpack_from('<Q', full, KDBG_KernBase)[0]
@@ -311,29 +328,6 @@ def _scan_kdbg(cr3, kernel_base_va):
             print(f"      PsActiveProcessHead = 0x{paph:x}")
             print(f"      MmPfnDatabase       = 0x{pfn:x}")
             print(f"      MmPhysicalMemoryBlock = 0x{pmblock:x}")
-            print(f"    KDBG raw hex (0x{kdbg_va:x}):")
-            for row in range(0, KDBG_STRUCT_SIZE, 32):
-                line = full[row:row+32] if row+32 <= len(full) else full[row:]+b'\x00'*(32-(len(full)-row))
-                if len(line) < 32:
-                    line = line + b'\x00' * (32 - len(line))
-                hex_part = ' '.join(f'{b:02x}' for b in line)
-                print(f"      +0x{row:04x}: {hex_part}")
-            print(f"    KDBG field dump:")
-            fields = [
-                (0x00, 'ListEntry.Flink', 'Q'), (0x08, 'ListEntry.Blink', 'Q'),
-                (0x10, 'OwnerTag', 'I'), (0x14, 'Size', 'I'),
-                (0x18, 'KernBase', 'Q'), (0x48, 'PsLoadedModuleList', 'Q'),
-                (0x50, 'PsActiveProcessHead', 'Q'), (0xC0, 'MmPfnDatabase', 'Q'),
-                (0x88, 'KiBugcheckData', 'Q'), (0x270, 'MmPhysicalMemoryBlock', 'Q'),
-            ]
-            for off, name, fmt in fields:
-                if off + 8 <= len(full):
-                    if fmt == 'Q':
-                        v = struct.unpack_from('<Q', full, off)[0]
-                        print(f"      +0x{off:04x} {name:35s} 0x{v:016x}")
-                    else:
-                        v = struct.unpack_from('<I', full, off)[0]
-                        print(f"      +0x{off:04x} {name:35s} 0x{v:08x}")
             # Force-populate page tables by reading KDBG in virt mode
             _virt_mode()
             _read_mem(kdbg_va, 0x60)
@@ -350,18 +344,17 @@ def _scan_kdbg(cr3, kernel_base_va):
                 'mm_physical_memory_block': pmblock,
             }
 
-        offset += chunk_sz - 0xD0
+        if chunk_sz < chunk_len:
+            break
+        offset += step
 
     print("    ERROR: KDBG not found")
     return {}
 
 def _find_kernel_export_va(cr3, kernel_base_va, export_name):
     """Find a kernel PE export and return its VA."""
-    kpa = _va_to_pa(cr3, kernel_base_va)
-    if not kpa:
-        return 0
     try:
-        hdr = _read_phys(kpa, 0x200)
+        hdr = _read_kernel_va(cr3, kernel_base_va, 0x1000)
         if len(hdr) < 0x100 or hdr[:2] != b'MZ':
             return 0
         e_lfanew = struct.unpack_from('<I', hdr, 0x3C)[0]
@@ -370,7 +363,7 @@ def _find_kernel_export_va(cr3, kernel_base_va, export_name):
         if not exp_rva:
             return 0
 
-        expdir = _read_phys(kpa + exp_rva, 40)
+        expdir = _read_kernel_va(cr3, kernel_base_va + exp_rva, 40)
         if len(expdir) < 40:
             return 0
         num_names = struct.unpack_from('<I', expdir, 24)[0]
@@ -380,8 +373,8 @@ def _find_kernel_export_va(cr3, kernel_base_va, export_name):
         if not num_names or not addr_names or num_names > 0x10000:
             return 0
 
-        names_arr = _read_phys(kpa + addr_names, num_names * 4)
-        ord_arr = _read_phys(kpa + addr_ords, num_names * 2)
+        names_arr = _read_kernel_va(cr3, kernel_base_va + addr_names, num_names * 4)
+        ord_arr = _read_kernel_va(cr3, kernel_base_va + addr_ords, num_names * 2)
         if len(names_arr) < num_names * 4 or len(ord_arr) < num_names * 2:
             return 0
 
@@ -390,7 +383,7 @@ def _find_kernel_export_va(cr3, kernel_base_va, export_name):
             return 0
         min_rva = min(name_rvas)
         max_rva = max(name_rvas)
-        region = _read_phys(kpa + min_rva, min(max_rva - min_rva + 32, 0x10000))
+        region = _read_kernel_va(cr3, kernel_base_va + min_rva, min(max_rva - min_rva + 32, 0x10000))
         target = export_name.encode('ascii')
         for i, name_rva in enumerate(name_rvas):
             off = name_rva - min_rva
@@ -400,7 +393,7 @@ def _find_kernel_export_va(cr3, kernel_base_va, export_name):
                     end = len(region)
                 if region[off:end] == target:
                     ordinal = struct.unpack_from('<H', ord_arr, i * 2)[0]
-                    funcs_arr = _read_phys(kpa + addr_funcs, (ordinal + 1) * 4)
+                    funcs_arr = _read_kernel_va(cr3, kernel_base_va + addr_funcs, (ordinal + 1) * 4)
                     if len(funcs_arr) >= (ordinal + 1) * 4:
                         func_rva = struct.unpack_from('<I', funcs_arr, ordinal * 4)[0]
                         return kernel_base_va + func_rva
@@ -414,10 +407,7 @@ def _read_nt_build_number(cr3, kernel_base_va):
     va = _find_kernel_export_va(cr3, kernel_base_va, 'NtBuildNumber')
     if not va:
         return 0
-    data = _read_virt(va, 4)
-    if len(data) < 4:
-        pa = _va_to_pa(cr3, va)
-        data = _read_phys(pa, 4) if pa else b''
+    data = _read_kernel_va(cr3, va, 4)
     return (struct.unpack_from('<I', data, 0)[0] & 0xFFFF) if len(data) >= 4 else 0
 
 
@@ -426,10 +416,7 @@ def _read_ke_number_processors(cr3, kernel_base_va):
     va = _find_kernel_export_va(cr3, kernel_base_va, 'KeNumberProcessors')
     if not va:
         return 1
-    data = _read_virt(va, 1)
-    if len(data) < 1:
-        pa = _va_to_pa(cr3, va)
-        data = _read_phys(pa, 1) if pa else b''
+    data = _read_kernel_va(cr3, va, 1)
     count = data[0] if data else 1
     return count if 1 <= count <= 0x40 else 1
 
@@ -506,6 +493,18 @@ def _read_physmem_descriptor(kdbg_va):
 
     return (runs, num_pages)
 
+def _normalize_runs(runs):
+    """Drop empty runs and merge overlapping or adjacent PFN ranges."""
+    merged = []
+    for bp, pc in sorted((int(bp), int(pc)) for bp, pc in runs if pc > 0):
+        end = bp + pc
+        if merged and merged[-1][0] + merged[-1][1] >= bp:
+            base, count = merged[-1]
+            merged[-1] = (base, max(base + count, end) - base)
+        else:
+            merged.append((bp, pc))
+    return merged
+
 
 # ═══════════════════════════════════════════════════════════════
 #  Context record
@@ -554,8 +553,11 @@ def _build_context_x64():
 #  Dump header builder
 # ═══════════════════════════════════════════════════════════════
 
-def _build_header(info, runs, num_pages, ctx_bytes):
+def _build_header(info, runs, ctx_bytes):
     """Build 8KB DUMP_HEADER64."""
+    num_pages = sum(pc for _, pc in runs)
+    if len(runs) > MAX_DUMP_HEADER64_RUNS:
+        raise ValueError(f"too many physical memory runs for DUMP_HEADER64: {len(runs)}")
     buf = bytearray(DUMP_HEADER64_SIZE)
     # Fill with PAGE signature
     for i in range(0, len(buf), 4):
@@ -582,8 +584,7 @@ def _build_header(info, runs, num_pages, ctx_bytes):
     ver = b"gdb2dmp"
     buf[DH64_VERSION_USER:DH64_VERSION_USER + len(ver)] = ver
     # Physical memory descriptor
-    max_runs = (0x348 - 0x98) // 16
-    runs_to_write = min(len(runs), max_runs)
+    runs_to_write = len(runs)
     struct.pack_into('<I', buf, DH64_PHYSICAL_MEMORY_BLOCK, runs_to_write)
     struct.pack_into('<Q', buf, DH64_PHYSICAL_MEMORY_BLOCK + 8, num_pages)
     p = DH64_PHYSICAL_MEMORY_BLOCK + 0x10
@@ -608,7 +609,7 @@ def _build_header(info, runs, num_pages, ctx_bytes):
     for _ in range(15):
         struct.pack_into('<Q', buf, p, 0); p += 8       # ExceptionInformation
     struct.pack_into('<I', buf, DH64_DUMP_TYPE, DUMP_TYPE_FULL)
-    struct.pack_into('<Q', buf, DH64_REQUIRED_DUMP_SPACE, 0)
+    struct.pack_into('<Q', buf, DH64_REQUIRED_DUMP_SPACE, DUMP_HEADER64_SIZE + num_pages * PAGE_SIZE)
 
     st = info.get('system_time', 0)
     ut = info.get('system_up_time', 0)
@@ -621,8 +622,7 @@ def _build_header(info, runs, num_pages, ctx_bytes):
     struct.pack_into('<I', buf, DH64_SUITE_MASK, info.get('suite_mask', 0))
     struct.pack_into('<I', buf, DH64_MINI_DUMP_FIELDS, 0)
     struct.pack_into('<I', buf, DH64_SECONDARY_DATA_STATE, 0)
-    struct.pack_into('<I', buf, 0x1048, 0)  # Reserved1
-    struct.pack_into('<I', buf, DH64_WRITER_STATUS, 0)
+    struct.pack_into('<B', buf, DH64_WRITER_STATUS, 0)
     struct.pack_into('<B', buf, DH64_KD_SECONDARY_VERSION, 0)
     return bytes(buf)
 
@@ -632,7 +632,7 @@ def _build_header(info, runs, num_pages, ctx_bytes):
 # ═══════════════════════════════════════════════════════════════
 
 class Gdb2DmpCommand(gdb.Command):
-    """gdb2dmp <host:port> <output.dmp> [options]
+    """gdb2dmp <host:port> <output.dmp>
 
     Convert a live Windows VM (via GDB stub) to a crash dump file.
     All operations run inside GDB — memory reads use GDB's C internals.
@@ -642,35 +642,23 @@ class Gdb2DmpCommand(gdb.Command):
         super().__init__("gdb2dmp", gdb.COMMAND_DATA)
 
     def invoke(self, arg, from_tty):
-        import getopt
         args = gdb.string_to_argv(arg)
-        if len(args) < 2:
-            print("Usage: gdb2dmp <host:port> <output.dmp> [--kernel-base 0x..] [--dtb 0x..]")
+        if len(args) != 2:
+            print("Usage: gdb2dmp <host:port> <output.dmp>")
             return
 
         target = args[0]
         output = args[1]
-        opts = args[2:]
-
-        kernel_base_override = 0
-        dtb_override = 0
-        ram_mb = 0
-        i = 0
-        while i < len(opts):
-            if opts[i] == '--kernel-base' and i + 1 < len(opts):
-                kernel_base_override = int(opts[i+1], 0)
-                i += 2
-            elif opts[i] == '--dtb' and i + 1 < len(opts):
-                dtb_override = int(opts[i+1], 0)
-                i += 2
-            elif opts[i] == '--ram-mb' and i + 1 < len(opts):
-                ram_mb = int(opts[i+1])
-                i += 2
-            else:
-                i += 1
 
         host, _, port_str = target.partition(':')
-        port = int(port_str)
+        if not host or not port_str:
+            print("Usage: gdb2dmp <host:port> <output.dmp>")
+            return
+        try:
+            port = int(port_str)
+        except ValueError:
+            print(f"ERROR: invalid port: {port_str}")
+            return
 
         # ── 1. Connect ──
         print(f"[*] Connecting to {host}:{port} ...")
@@ -679,7 +667,7 @@ class Gdb2DmpCommand(gdb.Command):
         gdb.execute("set endian little", to_string=True)
 
         # ── 2. Read CR3 and RIP ──
-        cr3 = dtb_override or _get_cr3()
+        cr3 = _get_cr3()
         if not cr3:
             print("ERROR: cannot read CR3")
             return
@@ -690,28 +678,12 @@ class Gdb2DmpCommand(gdb.Command):
         print(f"    RIP = 0x{rip:x}")
 
         # ── 3. Detect kernel base ──
-        if kernel_base_override:
-            kernel_base = kernel_base_override
-            print(f"[*] Using manual kernel base: 0x{kernel_base:x}")
-        else:
-            kernel_base = _detect_kernel_base(cr3, rip)
-
+        kernel_base = _detect_kernel_base(cr3, rip)
         if not kernel_base:
             print("ERROR: kernel base not detected")
             return
 
-        # ── 4. Read kernel PE header for size ──
-        _phys_mode()
-        kpa = _va_to_pa(cr3, kernel_base)
-        if kpa:
-            hdr = _read_phys(kpa, 480)
-            if len(hdr) >= 0x100 and hdr[:2] == b'MZ':
-                e_lfanew = struct.unpack_from('<I', hdr, 0x3C)[0]
-                if e_lfanew + 80 <= len(hdr):
-                    kernel_size = struct.unpack_from('<I', hdr, e_lfanew + 24 + 56)[0]
-                    print(f"    Kernel size = 0x{kernel_size:x}")
-
-        # ── 5. KDBG scan ──
+        # ── 4. KDBG scan ──
         info = _scan_kdbg(cr3, kernel_base)
         info['dtb'] = cr3
         info['kernel_base'] = kernel_base
@@ -719,46 +691,37 @@ class Gdb2DmpCommand(gdb.Command):
         if not info.get('kd_debugger_data_block'):
             print("WARNING: KdDebuggerDataBlock not found; dump may not load in WinDbg")
 
-        # ── 6. Read physical memory descriptor ──
+        # ── 5. Read physical memory descriptor ──
         print("[*] Discovering physical memory layout ...")
-        if ram_mb:
-            ram_bytes = ram_mb * 1024 * 1024
-            mb1 = 0x100000
-            runs = [(0, mb1 // PAGE_SIZE), (mb1 // PAGE_SIZE, (ram_bytes - mb1) // PAGE_SIZE)]
-            num_pages = ram_bytes // PAGE_SIZE
+        result = _read_physmem_descriptor(info.get('kd_debugger_data_block', 0))
+        if result:
+            runs, _ = result
         else:
-            result = _read_physmem_descriptor(info.get('kd_debugger_data_block', 0))
-            if result:
-                runs, num_pages = result
-            else:
-                # Fallback: detect RAM from page tables
-                ram = 256 * 1024 * 1024
-                mb1 = 0x100000
-                runs = [(0, mb1 // PAGE_SIZE), (mb1 // PAGE_SIZE, (ram - mb1) // PAGE_SIZE)]
-                num_pages = ram // PAGE_SIZE
+            # Fallback: detect RAM from page tables
+            ram = 256 * 1024 * 1024
+            mb1 = 0x100000
+            runs = [(0, mb1 // PAGE_SIZE), (mb1 // PAGE_SIZE, (ram - mb1) // PAGE_SIZE)]
 
-        # Ensure DTB page is in runs
+        runs = _normalize_runs(runs)
+
+        # Ensure DTB page is in runs.
         cr3_pfn = cr3 >> 12
-        dtb_in_runs = any(bp <= cr3_pfn < bp + pc for bp, pc in runs)
-        if not dtb_in_runs:
-            runs = sorted(runs + [(cr3_pfn, 1)], key=lambda r: r[0])
-            # Merge adjacent
-            merged = []
-            for r in runs:
-                if merged and merged[-1][0] + merged[-1][1] >= r[0]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], r[0] + r[1] - merged[-1][0]))
-                else:
-                    merged.append(r)
-            runs = merged
+        if not any(bp <= cr3_pfn < bp + pc for bp, pc in runs):
+            runs = _normalize_runs(runs + [(cr3_pfn, 1)])
 
+        if len(runs) > MAX_DUMP_HEADER64_RUNS:
+            print(f"ERROR: too many physical memory runs for DUMP_HEADER64: {len(runs)} > {MAX_DUMP_HEADER64_RUNS}")
+            return
+
+        num_pages = sum(pc for _, pc in runs)
         print(f"    {len(runs)} run(s), {num_pages} pages ({num_pages * PAGE_SIZE // (1024*1024)} MB)")
 
-        # ── 7. Read CPU context ──
+        # ── 6. Read CPU context ──
         print("[*] Reading CPU context ...")
         _virt_mode()
         ctx = _build_context_x64()
 
-        # ── 8. Read KUSER_SHARED_DATA ──
+        # ── 7. Read KUSER_SHARED_DATA ──
         kuser = {}
         try:
             kdata = _read_virt(KUSER_SHARED_DATA, 0x280)
@@ -768,9 +731,6 @@ class Gdb2DmpCommand(gdb.Command):
                 kuser['system_up_time'] = struct.unpack_from('<Q', kdata, 0x08)[0]
             if len(kdata) >= 0x268:
                 kuser['product_type'] = struct.unpack_from('<I', kdata, 0x260)[0]
-            if len(kdata) >= 0x270:
-                kuser['os_major_version'] = struct.unpack_from('<I', kdata, 0x268)[0]
-                kuser['os_minor_version'] = struct.unpack_from('<I', kdata, 0x26C)[0]
         except:
             pass
 
@@ -792,9 +752,9 @@ class Gdb2DmpCommand(gdb.Command):
         info['major_version'] = 0x0F
         info['minor_version'] = build_number or 0
 
-        # ── 9. Build and write dump header ──
+        # ── 8. Build and write dump header ──
         print(f"[*] Writing dump header to {output} ...")
-        header = _build_header(info, runs, num_pages, ctx)
+        header = _build_header(info, runs, ctx)
         with open(output, 'wb') as f:
             f.write(header)
 
@@ -803,7 +763,7 @@ class Gdb2DmpCommand(gdb.Command):
         print(f"    Header DTB  = 0x{dtb_hdr:x}")
         print(f"    Header KdDebuggerDataBlock = 0x{kdbg_hdr:x}")
 
-        # ── 10. Dump physical memory via GDB dump append binary memory ──
+        # ── 9. Append physical memory directly through GDB ──
         total_mb = num_pages * PAGE_SIZE // (1024 * 1024)
         print(f"[*] Dumping {total_mb} MB physical memory ...")
 
@@ -811,6 +771,7 @@ class Gdb2DmpCommand(gdb.Command):
         t0 = time.time()
         total_bytes = num_pages * PAGE_SIZE
         written = 0
+        output_for_gdb = _gdb_cli_filename(output)
 
         for run_idx, (base_page, page_count) in enumerate(runs):
             pa_start = base_page * PAGE_SIZE
@@ -819,19 +780,8 @@ class Gdb2DmpCommand(gdb.Command):
             pa_end = pa_start + pa_size
             print(f"  Run {run_idx}: 0x{pa_start:x} ({run_mb} MB)")
 
-            # GDB dump to temp file (C internals, no Python data copies)
-            tmpfile = f"{output}.run{run_idx}.tmp"
-            gdb.execute(f"dump binary memory {tmpfile} 0x{pa_start:x} 0x{pa_end:x}",
+            gdb.execute(f"append binary memory {output_for_gdb} 0x{pa_start:x} 0x{pa_end:x}",
                         to_string=True)
-            # Append to output file
-            with open(output, 'ab') as fout:
-                with open(tmpfile, 'rb') as ftmp:
-                    while True:
-                        chunk = ftmp.read(16 * 1024 * 1024)  # 16MB at a time
-                        if not chunk:
-                            break
-                        fout.write(chunk)
-            os.unlink(tmpfile)
             written += pa_size
             pct = written * 100 // total_bytes
             mb_done = written // (1024 * 1024)
