@@ -2,8 +2,6 @@
 
 This is a Python script. It converts a Windows x64 virtual machine with a GDB remote stub into a full kernel dump that can be loaded by WinDbg.
 
-------
-
 ![](./image.png)
 
 ## Usage
